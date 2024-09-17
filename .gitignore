@@ -1,0 +1,5 @@
+/__pycache__/
+dipole_tf/__pycache__/
+/dipole_torch/__pycache__/
+/processed_data/
+/run.sh
