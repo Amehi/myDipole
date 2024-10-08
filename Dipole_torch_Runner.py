@@ -25,11 +25,11 @@ from pathlib import Path
 from mydataloader import TrainDataset, EvalDataset
 import torch.utils.data as data_utils
 from tqdm import tqdm
-
+from Dipole_test import ndcg_at_k, precision_at_k
 starttime = time.time()
 
 def multi_label_classification_task_eval(pred, targets, threshold=0.5):
-    pred_binary = (pred > 0.5).astype(int)
+    pred_binary = (pred > threshold).astype(int)
 
     # 计算F1分数 (micro, macro, and weighted)
     f1_micro = f1_score(targets, pred_binary, average='micro')
@@ -130,11 +130,11 @@ def fix_random_seed_as(random_seed):
 
 def train_predict(args):
     batch_size=100
-    epochs=50
+    epochs=100
     topk=30
     L2=1e-8
     fix_random_seed_as(args.seed)
-    device = torch.device("cuda:1" if torch.cuda.is_available() == True else 'cpu')
+    device = torch.device("cuda:4" if torch.cuda.is_available() == True else 'cpu')
 
 
     data = load_data(args.dataset)
@@ -152,6 +152,7 @@ def train_predict(args):
 
     model = Dipole(input_dim=1, day_dim=100, rnn_hiddendim=300, output_dim=len(data['smap_l'])+1)
 
+
     params = list(model.parameters())
     k = 0
     for i in params:
@@ -165,8 +166,42 @@ def train_predict(args):
 
     optimizer = Adadelta(model.parameters(), lr=1, weight_decay=L2)
     loss_mce = nn.CrossEntropyLoss(reduction='sum')
-    model = model.cuda(device=1)
+    model = model.to(device)
+    if args.resume:
+        checkpoint = torch.load(f"./model/saved_model_seed{args.seed}_{args.dataset}")
+        save_epoch = checkpoint['epoch']
+        print("last saved model is in epoch {}".format(save_epoch))
+        model.load_state_dict(checkpoint['net'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        epochs = epochs-save_epoch
+    if args.test:
+        checkpoint = torch.load(f"./model/saved_model_seed{args.seed}_{args.dataset}")
+        save_epoch = checkpoint['epoch']
+        print("last saved model is in epoch {}".format(save_epoch))
+        model.load_state_dict(checkpoint['net'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        model.eval()
+        y_true = []
+        y_pred = []
+        with torch.no_grad():
+            model.eval()
+            for step, (batch_x, candidate, batch_y) in enumerate(tqdm(test_dataloader)):
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device)
+                candidate = candidate.to(device)
+                y_hat = model(batch_x)
+                y_hat = y_hat[-1,:,:].gather(1, candidate)
 
+                y_pred += list(y_hat.cpu().detach().numpy().flatten())
+                y_true += list(batch_y.cpu().numpy().flatten())
+
+        y_pred = np.array(y_pred)
+        y_true = np.array(y_true)
+        ret = multi_label_classification_task_eval(y_pred, y_true)
+        print("result: ", ret)
+        with open(f"./result/test_result_seed{args.seed}_{args.dataset}.json", 'w') as f:
+            json.dump(ret, f)
+        return
     best_aucpr = 0
     for epoch in range(epochs):
         starttime = time.time()
@@ -212,8 +247,8 @@ def train_predict(args):
                 # patients_batch_reshape, patients_lengths = model.padTrainMatrix(patients_batch)
                 # batch_x = patients_batch_reshape[0:-1]
                 # batch_y = patients_batch_reshape[1:, :, :283]
-                batch_x = torch.stack(batch_x).to(device).float()
-                batch_y = torch.tensor(batch_y).to(device).float()
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device)
                 candidate = candidate.to(device)
                 y_hat = model(batch_x)
                 y_hat = y_hat[-1,:,:].gather(1, candidate)
@@ -231,7 +266,8 @@ def train_predict(args):
                 # gbert_len.append(patients_lengths)
                 y_pred += list(y_hat.cpu().detach().numpy().flatten())
                 y_true += list(batch_y.cpu().numpy().flatten())
-                
+        y_pred = np.array(y_pred)
+        y_true = np.array(y_true)
         print("Test:Epoch-" + str(epoch) + " Loss:" + str(all_loss) + " Test Time:" + str(time.time() - starttime))
         ret = multi_label_classification_task_eval(y_pred, y_true)
         print("eval result: ", ret)
@@ -254,21 +290,35 @@ def train_predict(args):
     model.eval()
     y_true = []
     y_pred = []
+    batch_res_ndcg = []
+    batch_res_precision = []
     with torch.no_grad():
         model.eval()
-        for step, (batch_x, candidates, batch_y) in enumerate(tqdm(test_dataloader)):
-            batch_x = torch.stack(batch_x).to(device).float()
-            batch_y = torch.tensor(batch_y).to(device).float()
+        for step, (batch_x, candidate, batch_y) in enumerate(tqdm(test_dataloader)):
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
             candidate = candidate.to(device)
             y_hat = model(batch_x)
             y_hat = y_hat[-1,:,:].gather(1, candidate)
-
+            ndcg = []
+            precision = []
+            for k in [5,10,20]:
+                ndcg.append(ndcg_at_k(y_hat, batch_y, k))
+                precision.append(precision_at_k(y_hat,batch_y,k))
+            batch_res_ndcg.append(ndcg)
+            batch_res_precision.append(precision)
             y_pred += list(y_hat.cpu().detach().numpy().flatten())
             y_true += list(batch_y.cpu().numpy().flatten())
-
+    ndcg_array = np.array(batch_res_ndcg)
+    mean_ndcg = np.mean(ndcg_array, axis=0)
+    precision_array = np.array(batch_res_precision)
+    mean_precision = np.mean(precision_array,axis =0)
     y_pred = np.array(y_pred)
     y_true = np.array(y_true)
     ret = multi_label_classification_task_eval(y_pred, y_true)
+    for (k, ndcg, precision) in list(zip([5,10,20], mean_ndcg, mean_precision)):
+        ret[f'NDCG@{k}'] = ndcg
+        ret[f"Precision@{k}"] = precision
     print("result: ", ret)
     with open(f"./result/test_result_seed{args.seed}_{args.dataset}.json", 'w') as f:
         json.dump(ret, f)
@@ -279,6 +329,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default='mimic4')
     parser.add_argument('--seed', type=int, default=2024)
+    parser.add_argument('--resume', default=False, action=argparse.BooleanOptionalAction)
+    parser.add_argument('--test', default=False, action=argparse.BooleanOptionalAction)
     args = parser.parse_args()
     train_predict(args)
 

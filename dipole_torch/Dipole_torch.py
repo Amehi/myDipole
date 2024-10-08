@@ -59,7 +59,7 @@ class Dipole(nn.Module):
     def forward(self, x):
         # x = torch.tensor(x)
         # embedding层
-        h_0 = self.initHidden(x.shape[1])
+        h_0 = self.initHidden(x.shape[1]).to(x.device)
         self.day_emb = self.day_embedding(x)    # shape=(seq_len, batch_size, day_dim)
 
         # LSTM层
@@ -79,7 +79,7 @@ class Dipole(nn.Module):
         return y_hat
 
     def initHidden(self, batch_size):
-        return torch.zeros(1, batch_size, self.rnn_hiddendim, device=torch.device('cuda:1'))
+        return torch.zeros(1, batch_size, self.rnn_hiddendim)
 
     def padTrainMatrix(self, seqs):
         lengths = np.array([len(seq) for seq in seqs]).astype("int32")
